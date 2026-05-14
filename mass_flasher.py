@@ -3,6 +3,7 @@ import shutil
 import threading
 import time
 import platform
+import concurrent.futures
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
@@ -10,7 +11,7 @@ from tkinter import ttk
 class MicrobitFlasherApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Micro:bit Mass Flasher")
+        self.root.title("Micro:bit Mass Flasher (Concurrent)")
         self.root.geometry("450x250")
         self.root.resizable(False, False)
 
@@ -41,10 +42,8 @@ class MicrobitFlasherApp:
 
         if os_type == "Windows":
             import string
-            # Check all available drive letters on Windows
             for letter in string.ascii_uppercase:
                 drive_path = f"{letter}:\\"
-                # micro:bits always contain a DETAILS.TXT file
                 if os.path.exists(os.path.join(drive_path, "DETAILS.TXT")):
                     drives.append(drive_path)
                     
@@ -52,12 +51,10 @@ class MicrobitFlasherApp:
             volumes_path = "/Volumes"
             if os.path.exists(volumes_path):
                 for vol in os.listdir(volumes_path):
-                    # Look for volumes named MICROBIT
                     if "MICROBIT" in vol.upper():
                         drives.append(os.path.join(volumes_path, vol))
                         
         elif os_type == "Linux":
-            # Linux usually mounts in /media/username/
             user = os.environ.get("USER")
             media_path = f"/media/{user}"
             if os.path.exists(media_path):
@@ -74,7 +71,7 @@ class MicrobitFlasherApp:
         )
         
         if not self.hex_file_path:
-            return # User canceled
+            return 
 
         microbits = self.find_microbits()
         
@@ -83,29 +80,45 @@ class MicrobitFlasherApp:
             self.status_var.set("No micro:bits found.")
             return
 
-        self.status_var.set(f"Found {len(microbits)} micro:bits. Flashing...")
+        self.status_var.set(f"Found {len(microbits)} micro:bits. Flashing concurrently...")
         self.select_btn.config(state=tk.DISABLED)
         self.progress["value"] = 0
         self.progress["maximum"] = len(microbits)
 
-        # Run the flashing in a separate thread so the GUI doesn't freeze
-        threading.Thread(target=self.flash_devices, args=(microbits,), daemon=True).start()
+        # Start the thread manager
+        threading.Thread(target=self.manage_concurrent_flashing, args=(microbits,), daemon=True).start()
 
-    def flash_devices(self, microbits):
+    def copy_to_single_drive(self, drive):
+        """Worker function for a single thread to copy the file."""
+        try:
+            destination = os.path.join(drive, os.path.basename(self.hex_file_path))
+            shutil.copy2(self.hex_file_path, destination)
+            return True
+        except Exception as e:
+            print(f"Failed to flash {drive}: {e}")
+            return False
+
+    def manage_concurrent_flashing(self, microbits):
+        """Spawns a thread for every micro:bit and tracks their completion."""
         success_count = 0
-        
-        for index, drive in enumerate(microbits):
-            try:
-                # The shutil.copy2 command mimics a drag-and-drop action
-                destination = os.path.join(drive, os.path.basename(self.hex_file_path))
-                shutil.copy2(self.hex_file_path, destination)
-                success_count += 1
-            except Exception as e:
-                print(f"Failed to flash {drive}: {e}")
+        completed_count = 0
+
+        # Create a thread pool with enough workers for all devices
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(microbits)) as executor:
+            # Submit all copying tasks simultaneously 
+            future_to_drive = {executor.submit(self.copy_to_single_drive, drive): drive for drive in microbits}
             
-            # Update progress bar safely from thread
-            self.root.after(0, self.update_progress, index + 1)
-            
+            # as_completed yields futures as soon as they finish (success or fail)
+            for future in concurrent.futures.as_completed(future_to_drive):
+                completed_count += 1
+                
+                if future.result(): # If copy_to_single_drive returned True
+                    success_count += 1
+                
+                # Update the progress bar safely from the background thread
+                self.root.after(0, self.update_progress, completed_count)
+
+        # All threads are done, update the final UI
         self.root.after(0, self.finish_flashing, success_count, len(microbits))
 
     def update_progress(self, value):
@@ -114,7 +127,7 @@ class MicrobitFlasherApp:
     def finish_flashing(self, success, total):
         self.select_btn.config(state=tk.NORMAL)
         self.status_var.set(f"Finished! Successfully flashed {success}/{total} devices.")
-        messagebox.showinfo("Complete", f"Flashing complete!\n{success} out of {total} micro:bits updated.")
+        messagebox.showinfo("Complete", f"Concurrent flashing complete!\n{success} out of {total} micro:bits updated.")
 
 if __name__ == "__main__":
     root = tk.Tk()
